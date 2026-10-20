@@ -1,1 +1,695 @@
 
+package com.bcgov.budgetapp
+
+import android.content.Context
+import android.graphics.*
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.text.InputType
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.widget.*
+import androidx.activity.OnBackPressedCallback
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
+import org.json.JSONArray
+import org.json.JSONObject
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.*
+
+
+data class Expense(val id: Long, val title: String, val amount: Double, val type: String, val date: Long)
+data class Goal(val id: Long, val name: String, val target: Double, val saved: Double)
+
+class Auth(context: Context) {
+    private val prefs = context.getSharedPreferences("bcgov_auth", Context.MODE_PRIVATE)
+
+    private fun hash(s: String) =
+        MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).joinToString("") { "%02x".format(it) }
+
+    /** Returns an error message, or null when the account was created (and logged in). */
+    fun register(name: String, email: String, pass: String): String? {
+        val e = email.trim().lowercase()
+        val key = "u:$e"
+        return when {
+            name.isBlank() || e.isBlank() || pass.isBlank() -> "Fill in all fields"
+            !e.contains("@") -> "Enter a valid email"
+            pass.length < 4 -> "Password must be at least 4 characters"
+            prefs.contains(key) -> "That email is already registered"
+            else -> {
+                val data = JSONObject().put("name", name.trim()).put("hash", hash(pass)).toString()
+                prefs.edit().putString(key, data).putString("session", e).apply()
+                null
+            }
+        }
+    }
+
+    fun login(email: String, pass: String): Boolean {
+        val e = email.trim().lowercase()
+        val raw = prefs.getString("u:$e", null) ?: return false
+        val ok = JSONObject(raw).getString("hash") == hash(pass)
+        if (ok) prefs.edit().putString("session", e).apply()
+        return ok
+    }
+
+    fun current(): String? = prefs.getString("session", null)
+
+    fun nameOf(email: String): String =
+        prefs.getString("u:$email", null)?.let { JSONObject(it).getString("name") } ?: email
+
+    fun logout() = prefs.edit().remove("session").apply()
+}
+
+// ===================== BUDGET DATA (per user) =====================
+class Store(context: Context, private val user: String) {
+    private val prefs = context.getSharedPreferences("bcgov_budget", Context.MODE_PRIVATE)
+    private fun k(name: String) = "$user:$name"
+
+    val allowance: Double get() = prefs.getString(k("allowance"), "0")?.toDoubleOrNull() ?: 0.0
+    val periodDays: Int get() = prefs.getInt(k("periodDays"), 7)
+    val periodStart: Long get() = prefs.getLong(k("periodStart"), 0L)
+
+    fun startBudget(allowance: Double, days: Int) {
+        prefs.edit()
+            .putString(k("allowance"), allowance.toString())
+            .putInt(k("periodDays"), days)
+            .putLong(k("periodStart"), System.currentTimeMillis())
+            .apply()
+    }
+
+    fun clearAll() {
+        val e = prefs.edit()
+        listOf("allowance", "periodDays", "periodStart", "expenses", "goals").forEach { e.remove(k(it)) }
+        e.apply()
+    }
+
+    
+    fun expenses(): List<Expense> {
+        val arr = JSONArray(prefs.getString(k("expenses"), "[]"))
+        return (0 until arr.length()).map {
+            val o = arr.getJSONObject(it)
+            Expense(o.getLong("id"), o.getString("title"), o.getDouble("amount"), o.getString("type"), o.getLong("date"))
+        }
+    }
+
+    fun periodExpenses(): List<Expense> = expenses().filter { it.date >= periodStart }
+
+    fun addExpense(title: String, amount: Double, type: String) {
+        val now = System.currentTimeMillis()
+        saveExpenses(expenses() + Expense(now, title, amount, type, now))
+    }
+
+    fun deleteExpense(id: Long) = saveExpenses(expenses().filter { it.id != id })
+
+    private fun saveExpenses(list: List<Expense>) {
+        val arr = JSONArray()
+        list.forEach {
+            arr.put(JSONObject().put("id", it.id).put("title", it.title)
+                .put("amount", it.amount).put("type", it.type).put("date", it.date))
+        }
+        prefs.edit().putString(k("expenses"), arr.toString()).apply()
+    }
+
+    fun spent(type: String): Double = periodExpenses().filter { it.type == type }.sumOf { it.amount }
+    fun totalSpent() = spent("Need") + spent("Want")
+    fun remaining() = allowance - totalSpent()
+    fun needsLimit() = allowance * 0.50
+    fun wantsLimit() = allowance * 0.30
+    fun savingsTarget() = allowance * 0.20
+
+    fun daysLeft(): Int {
+        val elapsed = ((System.currentTimeMillis() - periodStart) / 86_400_000L).toInt()
+        return maxOf(1, periodDays - elapsed)
+    }
+
+    fun dailyGuide(): Double = if (remaining() > 0) remaining() / daysLeft() else 0.0
+
+    fun percentUsed(): Int = if (allowance <= 0) 0 else minOf(100, (totalSpent() / allowance * 100).toInt())
+
+    fun alertMessage(): String? {
+        if (allowance <= 0) return null
+        val needs = spent("Need")
+        val wants = spent("Want")
+        val total = needs + wants
+        return when {
+            total > allowance -> "OVER BUDGET! You spent more than your allowance."
+            wants > wantsLimit() -> "Alert: your WANTS passed the 30% limit."
+            needs > needsLimit() -> "Alert: your NEEDS passed the 50% limit."
+            total >= allowance * 0.8 -> "Heads up: 80% of your allowance is used."
+            else -> null
+        }
+    }
+
+    
+    fun goals(): List<Goal> {
+        val arr = JSONArray(prefs.getString(k("goals"), "[]"))
+        return (0 until arr.length()).map {
+            val o = arr.getJSONObject(it)
+            Goal(o.getLong("id"), o.getString("name"), o.getDouble("target"), o.getDouble("saved"))
+        }
+    }
+
+    fun addGoal(name: String, target: Double) =
+        saveGoals(goals() + Goal(System.currentTimeMillis(), name, target, 0.0))
+
+    fun contribute(id: Long, amount: Double) =
+        saveGoals(goals().map { if (it.id == id) it.copy(saved = it.saved + amount) else it })
+
+    fun deleteGoal(id: Long) = saveGoals(goals().filter { it.id != id })
+
+    private fun saveGoals(list: List<Goal>) {
+        val arr = JSONArray()
+        list.forEach {
+            arr.put(JSONObject().put("id", it.id).put("name", it.name)
+                .put("target", it.target).put("saved", it.saved))
+        }
+        prefs.edit().putString(k("goals"), arr.toString()).apply()
+    }
+}
+
+// ===================== UI HELPERS (no XML needed) =====================
+private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+private const val DECIMAL = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+private const val PLAIN = InputType.TYPE_CLASS_TEXT
+private val GRAY = Color.parseColor("#777777")
+private val RED = Color.parseColor("#C62828")
+
+private fun peso(v: Double) = String.format(Locale.US, "₱%,.2f", v)
+
+private fun Context.dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+private fun Context.lp(w: Int = MATCH, h: Int = WRAP, weight: Float = 0f, top: Int = 0) =
+    LinearLayout.LayoutParams(w, h, weight).apply { topMargin = dp(top) }
+
+private fun Context.label(s: String, size: Float = 14f, bold: Boolean = false, color: Int = Color.BLACK) =
+    TextView(this).apply {
+        text = s
+        textSize = size
+        setTextColor(color)
+        if (bold) setTypeface(typeface, Typeface.BOLD)
+    }
+
+private fun Context.field(hint: String, type: Int) = EditText(this).apply {
+    this.hint = hint
+    inputType = type
+    setTextColor(Color.BLACK)
+    setHintTextColor(GRAY)
+}
+
+private fun Context.btn(caption: String, onClick: () -> Unit) = Button(this).apply {
+    text = caption
+    setOnClickListener { onClick() }
+}
+
+private fun Context.bar(p: Int) =
+    ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100; progress = p }
+
+/** Rounded outlined box, like the wireframe cards. */
+private fun Context.box(fill: Int = Color.WHITE, dashed: Boolean = false): LinearLayout =
+    LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(12), dp(12), dp(12), dp(12))
+        background = GradientDrawable().apply {
+            setColor(fill)
+            cornerRadius = dp(10).toFloat()
+            if (dashed) setStroke(dp(1), GRAY, dp(4).toFloat(), dp(3).toFloat()) else setStroke(dp(1), GRAY)
+        }
+    }
+
+/** Donut chart for the Spending Summary screen. */
+class DonutView(context: Context, private val percent: Int, private val color: Int) : View(context) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val stroke = width * 0.14f
+        val rect = RectF(stroke, stroke, width - stroke, height - stroke)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = stroke
+        paint.color = Color.parseColor("#DDDDDD")
+        canvas.drawArc(rect, 0f, 360f, false, paint)
+        paint.color = color
+        canvas.drawArc(rect, -90f, 360f * percent / 100f, false, paint)
+        paint.style = Paint.Style.FILL
+        paint.color = Color.BLACK
+        paint.textSize = width * 0.13f
+        paint.textAlign = Paint.Align.CENTER
+        canvas.drawText("$percent% used", width / 2f, height / 2f + paint.textSize / 3f, paint)
+    }
+}
+
+// ===================== THE APP (one activity, many screens) =====================
+class MainActivity : AppCompatActivity() {
+    private lateinit var auth: Auth
+    private lateinit var store: Store
+    private lateinit var frame: FrameLayout
+    private lateinit var navItems: List<TextView>
+    private var user = ""
+    private var inShell = false
+    private var signupMode = false
+    private var current = "home"
+    private var lastTab = "home"
+    private var histFilter = "All"
+    private var newType = "Need"
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO)
+        super.onCreate(savedInstanceState)
+        auth = Auth(this)
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                when {
+                    !inShell && signupMode -> showAuth(false)
+                    !inShell -> finish()
+                    current in listOf("add", "summary", "goals") -> show(lastTab)
+                    current != "home" -> show("home")
+                    else -> finish()
+                }
+            }
+        })
+
+        val u = auth.current()
+        if (u != null) enterApp(u) else showAuth(false)
+    }
+
+    private fun toast(s: String, long: Boolean = false) =
+        Toast.makeText(this, s, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+
+    private fun confirm(title: String, msg: String, onYes: () -> Unit) {
+        AlertDialog.Builder(this).setTitle(title).setMessage(msg)
+            .setPositiveButton("Yes") { _, _ -> onYes() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ---------- Welcome / Login / Sign up ----------
+    private fun showAuth(signup: Boolean) {
+        signupMode = signup
+        inShell = false
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(80), dp(24), dp(24))
+        }
+        col.addView(label("💰 BCGOV Budget", 26f, true).apply { gravity = Gravity.CENTER })
+        col.addView(label("Track your allowance. Spend smarter.", 13f, color = GRAY).apply { gravity = Gravity.CENTER })
+        col.addView(label(if (signup) "Create account" else "Welcome back", 18f, true), lp(top = 32))
+
+        val etName = field("Full name", PLAIN)
+        val etEmail = field("Email", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS)
+        val etPass = field("Password", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        if (signup) col.addView(etName)
+        col.addView(etEmail)
+        col.addView(etPass)
+
+        if (signup) {
+            col.addView(btn("SIGN UP") {
+                val err = auth.register(etName.text.toString(), etEmail.text.toString(), etPass.text.toString())
+                if (err != null) toast(err) else enterApp(auth.current()!!, "budget")
+            }, lp(top = 16))
+            col.addView(btn("Back to log in") { showAuth(false) })
+        } else {
+            col.addView(btn("LOG IN") {
+                if (auth.login(etEmail.text.toString(), etPass.text.toString())) enterApp(auth.current()!!)
+                else toast("Wrong email or password")
+            }, lp(top = 16))
+            col.addView(btn("SIGN UP") { showAuth(true) })
+        }
+        setContentView(ScrollView(this).apply {
+            setBackgroundColor(Color.WHITE)
+            addView(col)
+        })
+    }
+
+    private fun enterApp(u: String, tab: String = "home") {
+        user = u
+        store = Store(this, u)
+        buildShell()
+        show(tab)
+    }
+
+    // ---------- Shell: content area + bottom navigation ----------
+    private fun buildShell() {
+        inShell = true
+        frame = FrameLayout(this)
+        val nav = LinearLayout(this).apply { setBackgroundColor(Color.parseColor("#EEEEEE")) }
+        val defs = listOf("🏠\nHome" to "home", "🧾\nHistory" to "history", "💰\nBudget" to "budget", "👤\nProfile" to "profile")
+        navItems = defs.map { (caption, target) ->
+            TextView(this).apply {
+                this.text = caption
+                gravity = Gravity.CENTER
+                textSize = 12f
+                setTextColor(Color.BLACK)
+                setPadding(0, dp(8), 0, dp(8))
+                setOnClickListener { show(target) }
+            }.also { nav.addView(it, lp(0, WRAP, 1f)) }
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            setPadding(0, dp(40), 0, dp(16))
+            addView(frame, lp(MATCH, 0, 1f))
+            addView(nav, lp())
+        }
+        setContentView(root)
+    }
+
+    private fun show(name: String) {
+        current = name
+        if (name in listOf("home", "history", "budget", "profile")) lastTab = name
+        val active = when (name) {
+            "home" -> 0
+            "history" -> 1
+            "profile" -> 3
+            else -> 2
+        }
+        navItems.forEachIndexed { i, tv ->
+            tv.setBackgroundColor(if (i == active) Color.parseColor("#C5CAE9") else Color.TRANSPARENT)
+        }
+        val screen: View = when (name) {
+            "home" -> dashboardScreen()
+            "history" -> historyScreen()
+            "budget" -> budgetScreen()
+            "summary" -> summaryScreen()
+            "goals" -> goalsScreen()
+            "add" -> addScreen()
+            else -> profileScreen()
+        }
+        frame.removeAllViews()
+        frame.addView(screen)
+    }
+
+    private fun page(title: String, back: Boolean = false, build: LinearLayout.() -> Unit): View {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(16))
+        }
+        val header = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        if (back) {
+            header.addView(label("←", 24f, true).apply {
+                setPadding(0, 0, dp(16), 0)
+                setOnClickListener { show(lastTab) }
+            })
+        }
+        header.addView(label(title, 20f, true))
+        col.addView(header)
+        col.build()
+        return ScrollView(this).apply { addView(col) }
+    }
+
+    private fun expenseRow(e: Expense, deletable: Boolean): View {
+        val row = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE)
+                cornerRadius = dp(10).toFloat()
+                setStroke(dp(1), GRAY)
+            }
+        }
+        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        info.addView(label(e.title, 15f, true))
+        val date = SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()).format(Date(e.date))
+        info.addView(label("${e.type} • $date", 12f, color = GRAY))
+        row.addView(info, lp(0, WRAP, 1f))
+        row.addView(label(peso(e.amount), 15f, true, if (e.type == "Want") RED else Color.BLACK))
+        if (deletable) {
+            row.addView(label("   ✕", 18f, true, GRAY).apply {
+                setOnClickListener {
+                    confirm("Delete expense?", e.title) { store.deleteExpense(e.id); show("history") }
+                }
+            })
+        }
+        return row
+    }
+
+    // ---------- Dashboard ----------
+    private fun dashboardScreen(): View = page("Hello, " + auth.nameOf(user)) {
+        val a = store.allowance
+        addView(box().apply {
+            addView(label("Remaining balance", 13f, color = GRAY))
+            addView(label(if (a > 0) peso(store.remaining()) else "₱0.00", 28f, true))
+            addView(label(if (a > 0) "of ${peso(a)} allowance" else "Set your allowance in the Budget tab", 13f, color = GRAY))
+        }, lp(top = 12))
+
+        addView(box().apply {
+            addView(label("Allowance used: ${store.percentUsed()}%", 14f, true))
+            addView(bar(store.percentUsed()), lp(top = 6))
+            addView(label("Daily spending guide: ${peso(store.dailyGuide())}/day (${store.daysLeft()} day(s) left)", 13f, color = GRAY), lp(top = 6))
+            val msg = store.alertMessage()
+            if (msg != null) addView(label(msg, 14f, true, RED), lp(top = 6))
+        }, lp(top = 12))
+
+        addView(label("Quick actions", 16f, true), lp(top = 16))
+        val tiles = LinearLayout(this@MainActivity)
+        listOf("➕\nAdd Expense" to "add", "📋\nBudget Plan" to "budget", "📊\nSummary" to "summary", "🎯\nGoals" to "goals")
+            .forEach { (caption, target) ->
+                val tile = box(dashed = true).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(dp(4), dp(4), dp(4), dp(4))
+                    setOnClickListener { show(target) }
+                }
+                tile.addView(label(caption, 11f).apply { gravity = Gravity.CENTER })
+                tiles.addView(tile, LinearLayout.LayoutParams(0, dp(90), 1f).apply { setMargins(dp(3), 0, dp(3), 0) })
+            }
+        addView(tiles, lp(top = 8))
+
+        addView(label("Recent expenses", 16f, true), lp(top = 16))
+        val recent = store.periodExpenses().sortedByDescending { it.date }.take(3)
+        if (recent.isEmpty()) addView(label("No expenses yet. Tap Add Expense.", 13f, color = GRAY), lp(top = 4))
+        recent.forEach { addView(expenseRow(it, false), lp(top = 6)) }
+    }
+
+    // ---------- Transactions / History ----------
+    private fun historyScreen(): View = page("Transactions") {
+        val tabs = LinearLayout(this@MainActivity)
+        listOf("All", "Need", "Want").forEach { f ->
+            tabs.addView(label(if (f == "All") "All" else f + "s", 15f, f == histFilter).apply {
+                setPadding(0, dp(8), dp(24), dp(8))
+                setOnClickListener { histFilter = f; show("history") }
+            })
+        }
+        addView(tabs)
+        addView(btn("➕ Add Expense") { show("add") })
+        val list = store.periodExpenses()
+            .filter { histFilter == "All" || it.type == histFilter }
+            .sortedByDescending { it.date }
+        if (list.isEmpty()) addView(label("No transactions to show.", 13f, color = GRAY), lp(top = 8))
+        list.forEach { addView(expenseRow(it, true), lp(top = 6)) }
+    }
+
+    // ---------- Budget Plan ----------
+    private fun budgetScreen(): View = page("Budget Plan") {
+        val etA = field("Allowance (₱)", DECIMAL)
+        val etD = field("Days (e.g. 7)", InputType.TYPE_CLASS_NUMBER)
+        if (store.allowance > 0) {
+            etA.setText(store.allowance.toString())
+            etD.setText(store.periodDays.toString())
+        } else {
+            etD.setText("7")
+        }
+        addView(box().apply {
+            addView(label("Allowance", 13f, color = GRAY))
+            addView(etA)
+            addView(etD)
+            addView(btn("Save Plan") {
+                val a = etA.text.toString().toDoubleOrNull()
+                val d = etD.text.toString().toIntOrNull()
+                if (a == null || a <= 0 || d == null || d <= 0) {
+                    toast("Enter a valid allowance and number of days")
+                } else {
+                    store.startBudget(a, d)
+                    toast("Budget plan saved (new period started)")
+                    show("budget")
+                }
+            })
+        }, lp(top = 12))
+
+        if (store.allowance > 0) {
+            addView(label("50 / 30 / 20 breakdown", 16f, true), lp(top = 16))
+            addView(box().apply {
+                listOf(
+                    "Needs (50%)" to Pair(store.spent("Need"), store.needsLimit()),
+                    "Wants (30%)" to Pair(store.spent("Want"), store.wantsLimit())
+                ).forEach { (n, p) ->
+                    val pct = if (p.second > 0) minOf(100, (p.first / p.second * 100).toInt()) else 0
+                    addView(label("$n: ${peso(p.first)} / ${peso(p.second)}", 14f), lp(top = 6))
+                    addView(bar(pct))
+                }
+                addView(label("Savings (20%): target ${peso(store.savingsTarget())}", 14f), lp(top = 10))
+            }, lp(top = 8))
+            addView(box(Color.parseColor("#EEEEEE")).apply {
+                addView(label("Total spent: ${peso(store.totalSpent())}", 14f, true))
+                addView(label("Remaining: ${peso(store.remaining())}", 14f, true))
+                addView(label("Daily spending guide: ${peso(store.dailyGuide())}/day (${store.daysLeft()} day(s) left)", 13f, color = GRAY))
+            }, lp(top = 8))
+        }
+        addView(btn("📊 View Spending Summary") { show("summary") }, lp(top = 12))
+        addView(btn("🎯 Savings Goals") { show("goals") })
+    }
+
+    // ---------- Spending Summary ----------
+    private fun summaryScreen(): View = page("Spending Summary", back = true) {
+        val a = store.allowance
+        if (a <= 0) {
+            addView(label("Set your allowance in Budget Plan first.", 14f, color = GRAY), lp(top = 12))
+            return@page
+        }
+        val pct = store.percentUsed()
+        val color = when {
+            pct >= 100 -> RED
+            pct >= 80 -> Color.parseColor("#F9A825")
+            else -> Color.parseColor("#2E7D32")
+        }
+        addView(box().apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(label("Allowance ${peso(a)}", 14f, true))
+            addView(DonutView(this@MainActivity, pct, color), lp(dp(200), dp(200), top = 8))
+            addView(label("Needs: ${peso(store.spent("Need"))}", 14f))
+            addView(label("Wants: ${peso(store.spent("Want"))}", 14f))
+            addView(label("Remaining: ${peso(store.remaining())}", 14f))
+        }, lp(top = 12))
+
+        val biggest = store.periodExpenses().maxByOrNull { it.amount }
+        val wants = store.spent("Want")
+        val total = store.totalSpent()
+        addView(box().apply {
+            addView(label("💡 Insight", 14f, true))
+            addView(label(store.alertMessage() ?: "You're on track. Keep it up!", 14f))
+            if (biggest != null) addView(label("Biggest expense: ${biggest.title} (${peso(biggest.amount)})", 13f, color = GRAY))
+            if (total > 0) addView(label("Wants are ${(wants / total * 100).toInt()}% of your spending.", 13f, color = GRAY))
+        }, lp(top = 12))
+    }
+
+    // ---------- Goals / Savings ----------
+    private fun goalsScreen(): View = page("Goals / Savings", back = true) {
+        val etN = field("Goal name (e.g. Laptop fund)", PLAIN)
+        val etT = field("Target amount (₱)", DECIMAL)
+        addView(box().apply {
+            addView(etN)
+            addView(etT)
+            addView(btn("ADD NEW GOAL") {
+                val n = etN.text.toString().trim()
+                val t = etT.text.toString().toDoubleOrNull()
+                if (n.isEmpty() || t == null || t <= 0) {
+                    toast("Enter a goal name and a valid target")
+                } else {
+                    store.addGoal(n, t)
+                    show("goals")
+                }
+            })
+        }, lp(top = 12))
+
+        store.goals().forEach { g ->
+            val pct = minOf(100, (g.saved / g.target * 100).toInt())
+            addView(box().apply {
+                addView(label(g.name, 16f, true))
+                addView(label("${peso(g.saved)} / ${peso(g.target)}  ($pct%)", 13f, color = GRAY))
+                addView(bar(pct), lp(top = 6))
+                val buttons = LinearLayout(this@MainActivity)
+                buttons.addView(btn("Add savings") { addToGoal(g) }, lp(0, WRAP, 1f))
+                buttons.addView(btn("Delete") {
+                    confirm("Delete goal?", g.name) { store.deleteGoal(g.id); show("goals") }
+                }, lp(0, WRAP, 1f))
+                addView(buttons)
+            }, lp(top = 10))
+        }
+    }
+
+    private fun addToGoal(g: Goal) {
+        val input = field("Amount to save", DECIMAL)
+        AlertDialog.Builder(this)
+            .setTitle("Add to \"${g.name}\"")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val amt = input.text.toString().toDoubleOrNull()
+                if (amt == null || amt <= 0) {
+                    toast("Invalid amount")
+                } else {
+                    store.contribute(g.id, amt)
+                    if (g.saved + amt >= g.target) toast("Goal reached! 🎉", true)
+                    show("goals")
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ---------- Add Expense ----------
+    private fun addScreen(): View {
+        newType = "Need"
+        return page("Add Expense", back = true) {
+            val etT = field("What did you buy?", PLAIN)
+            val etA = field("Amount (₱)", DECIMAL)
+            val needBtn = Button(this@MainActivity)
+            val wantBtn = Button(this@MainActivity)
+            fun refreshTypes() {
+                needBtn.text = (if (newType == "Need") "✔ " else "") + "Need"
+                wantBtn.text = (if (newType == "Want") "✔ " else "") + "Want"
+            }
+            needBtn.setOnClickListener { newType = "Need"; refreshTypes() }
+            wantBtn.setOnClickListener { newType = "Want"; refreshTypes() }
+            refreshTypes()
+
+            addView(label("Title", 13f, color = GRAY), lp(top = 12))
+            addView(etT)
+            addView(label("Amount", 13f, color = GRAY))
+            addView(etA)
+            addView(label("Type", 13f, color = GRAY))
+            val types = LinearLayout(this@MainActivity)
+            types.addView(needBtn, lp(0, WRAP, 1f))
+            types.addView(wantBtn, lp(0, WRAP, 1f))
+            addView(types)
+            addView(btn("SAVE EXPENSE") {
+                val title = etT.text.toString().trim()
+                val amt = etA.text.toString().toDoubleOrNull()
+                if (title.isEmpty() || amt == null || amt <= 0) {
+                    toast("Enter a title and a valid amount")
+                } else {
+                    store.addExpense(title, amt, newType)
+                    store.alertMessage()?.let { toast(it, true) }
+                    show("home")
+                }
+            }, lp(top = 12))
+        }
+    }
+
+    // ---------- Profile ----------
+    private fun profileScreen(): View = page("Profile") {
+        val name = auth.nameOf(user)
+        val avatar = label(name.take(1).uppercase(), 32f, true, Color.WHITE).apply {
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#5C6BC0"))
+            }
+        }
+        addView(avatar, lp(dp(90), dp(90), top = 12).apply { gravity = Gravity.CENTER_HORIZONTAL })
+        addView(label(name, 18f, true).apply { gravity = Gravity.CENTER }, lp(top = 8))
+        addView(label(user, 13f, color = GRAY).apply { gravity = Gravity.CENTER })
+
+        fun menuRow(caption: String, onClick: () -> Unit) {
+            addView(box().apply {
+                addView(label("$caption   ›", 15f))
+                setOnClickListener { onClick() }
+            }, lp(top = 8))
+        }
+        menuRow("Edit Budget Plan") { show("budget") }
+        menuRow("Savings Goals") { show("goals") }
+        menuRow("Spending Summary") { show("summary") }
+        menuRow("Clear My Data") {
+            confirm("Clear data?", "This deletes your expenses, goals and budget plan.") {
+                store.clearAll()
+                show("profile")
+            }
+        }
+        menuRow("Log Out") {
+            auth.logout()
+            showAuth(false)
+        }
+    }
+}
